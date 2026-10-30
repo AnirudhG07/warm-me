@@ -1,0 +1,17 @@
+[package]
+name = "warm-me"
+version = "0.1.0"
+edition = "2024"
+description = "Keep your laptop warm in the cold by turning spare CPU into heat"
+license = "MIT"
+repository = "https://github.com/AnirudhG07/warm-me"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+libc = "0.2.191"
+starship-battery = "0.12.0"
+sysinfo = "0.40.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
