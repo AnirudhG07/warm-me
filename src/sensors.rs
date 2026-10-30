@@ -100,6 +100,10 @@ impl Sensors {
 pub struct Load {
     sys: System,
     pid: Pid,
+    /// A volunteer-computing project heating for us: its processes are
+    /// heat, not "you working", so they're counted separately.
+    root: Option<u32>,
+    tree: Vec<u32>,
 }
 
 /// A process at or above this share of one core counts as "you working".
@@ -108,6 +112,8 @@ const BUSY_PROCESS: f32 = 0.5;
 /// One sample of CPU activity since the previous call.
 #[derive(Clone, Copy, Default)]
 pub struct Usage {
+    /// The watched project's use, in cores.
+    pub project: f32,
     /// Demand from busy programs other than us, in cores.
     pub busy: f32,
     /// Whole-machine CPU use, percent of all cores.
@@ -121,9 +127,25 @@ impl Load {
     pub fn new() -> Option<Self> {
         let sys = System::new().ok()?;
         let pid = sysinfo::get_current_pid().ok()?;
-        let mut load = Load { sys, pid };
+        let mut load = Load {
+            sys,
+            pid,
+            root: None,
+            tree: Vec::new(),
+        };
         load.sample();
         Some(load)
+    }
+
+    /// Count this process and everything it starts as the project.
+    pub fn watch(&mut self, root: Option<u32>) {
+        self.root = root;
+        self.tree.clear();
+    }
+
+    /// The watched project's processes as of the last sample.
+    pub fn tree(&self) -> &[u32] {
+        &self.tree
     }
 
     pub fn sample(&mut self) -> Usage {
@@ -134,20 +156,52 @@ impl Load {
             ProcessRefreshKind::nothing().with_cpu(),
         );
         let ncpu = self.sys.cpus().len().max(1) as f32;
+        self.tree = match self.root {
+            Some(root) => self
+                .sys
+                .processes()
+                .values()
+                .filter(|p| descends_from(&self.sys, p, root))
+                .map(|p| p.pid().as_u32())
+                .collect(),
+            None => Vec::new(),
+        };
+        let in_tree = |p: &Process| self.tree.contains(&p.pid().as_u32());
+        let project = self
+            .sys
+            .processes()
+            .values()
+            .filter(|p| in_tree(p))
+            .fold(0.0, |a, p| a + p.cpu_usage() / 100.0);
         let busy = self
             .sys
             .processes()
             .values()
             .filter(|p| p.pid() != self.pid && p.cpu_usage() >= BUSY_PROCESS * 100.0)
+            .filter(|p| !in_tree(p))
             .filter(|p| !is_kernel(p) && !is_background(p.pid().as_u32()))
             .fold(0.0, |a, p| a + p.cpu_usage() / 100.0);
         let ours = self.sys.process(self.pid).map_or(0.0, |p| p.cpu_usage());
         Usage {
+            project,
             busy,
             total_pct: self.sys.global_cpu_usage(),
             ours_pct: (ours / ncpu).min(100.0),
         }
     }
+}
+
+/// The process itself or one of its descendants.
+fn descends_from(sys: &System, p: &Process, root: u32) -> bool {
+    let mut cur = Some(p);
+    for _ in 0..64 {
+        match cur {
+            Some(c) if c.pid().as_u32() == root => return true,
+            Some(c) => cur = c.parent().and_then(|pp| sys.process(pp)),
+            None => return false,
+        }
+    }
+    false
 }
 
 fn is_kernel(p: &Process) -> bool {

@@ -45,6 +45,10 @@ pub struct Status {
     pub watts: Option<f32>,
     /// GPU heater output 0..=1, or None if there's no GPU heater.
     pub gpu: Option<f32>,
+    /// What's making the heat: a project, a program, or "built-in heat".
+    pub work: String,
+    /// The project's share of all cores, percent, if one is heating.
+    pub work_pct: Option<f32>,
     /// Controlled temperature, one sample per second, oldest first.
     pub history: Vec<Option<f32>>,
 }
@@ -176,14 +180,18 @@ pub fn spawn(opts: &Opts) -> io::Result<Info> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
 
-    let until = Instant::now() + Duration::from_secs(5);
+    // starting a project can take a moment (e.g. asking BOINC its state)
+    let until = Instant::now() + Duration::from_secs(10);
     while Instant::now() < until {
         if let Some(info) = find()
             && status(&info).is_ok()
         {
             return Ok(info);
+        }
+        if !matches!(child.try_wait(), Ok(None)) {
+            break; // it gave up: the log says why
         }
         thread::sleep(Duration::from_millis(50));
     }

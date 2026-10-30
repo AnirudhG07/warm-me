@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::client::{self, Info, Status};
 use crate::gpu::Gpu;
 use crate::heater::Heater;
+use crate::work::Work;
 use crate::sensors::{Load, Reading, Sensors, Usage};
 use crate::{Opts, Source, name, pick};
 
@@ -56,6 +57,15 @@ pub fn run(opts: Opts) {
         return;
     };
     let max_target = crate::max_target(source, &opts);
+    // start the project before anything else, so a missing one is reported
+    // straight back to the terminal that asked for it
+    let work = match Work::start(&opts.work_spec()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{e}");
+            return;
+        }
+    };
     let threads = opts
         .threads
         .unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
@@ -85,11 +95,17 @@ pub fn run(opts: Opts) {
     }));
     let running = Arc::new(AtomicBool::new(true));
     {
+        // a polite kill still shuts down cleanly: a paused project must
+        // never be left paused
+        let running = running.clone();
+        let _ = ctrlc::set_handler(move || running.store(false, Ordering::Relaxed));
+    }
+    {
         let (shared, running, token) = (shared.clone(), running.clone(), info.token.clone());
         thread::spawn(move || serve(listener, &token, &shared, &running));
     }
 
-    engine(&opts, source, threads, sensors, &shared, &running);
+    engine(&opts, source, threads, sensors, work, &shared, &running);
     client::unpublish();
 }
 
@@ -154,6 +170,7 @@ fn engine(
     source: Source,
     threads: usize,
     mut sensors: Sensors,
+    mut work: Option<Work>,
     shared: &Mutex<Shared>,
     running: &AtomicBool,
 ) {
@@ -165,6 +182,11 @@ fn engine(
         eprintln!("gpu heater ready: {}", g.name);
     }
     let mut load = Load::new();
+    if let Some(l) = &mut load {
+        l.watch(work.as_ref().map(|w| w.root));
+    }
+    let mut ended: Option<String> = None;
+    let mut project = 0.0f32; // project's share of all cores, smoothed
     let mut pi = Pi::new();
     let mut history: VecDeque<Option<f32>> = VecDeque::with_capacity(HISTORY);
     let (mut want, mut state) = (0.0, String::new());
@@ -202,6 +224,15 @@ fn engine(
                 boost = true;
             }
             heater.set_boost(boost);
+            // the project quit or went away: warm's own heater takes over
+            if let Some(w) = work.take_if(|w| !w.alive()) {
+                ended = Some(format!("{} stopped", w.label));
+                w.release();
+                project = 0.0;
+                if let Some(l) = &mut load {
+                    l.watch(None);
+                }
+            }
             if history.len() == HISTORY {
                 history.pop_front();
             }
@@ -223,7 +254,17 @@ fn engine(
         // yield instantly, come back gently so brief spikes don't cause stutter
         room = allowed.min(room + 0.1);
         let duty = want.min(max_duty) * room;
-        heater.set_duty(duty);
+        let ncpu = threads.max(1) as f32;
+        project += (usage.project / ncpu - project) * (tick.as_secs_f32() / BUSY_TAU);
+        // the project does what it can; warm's own heater tops up the rest
+        let fill = match &mut work {
+            Some(w) => {
+                w.set(duty, load.as_ref().map_or(&[], |l| l.tree()));
+                (duty - project).clamp(0.0, 1.0)
+            }
+            None => duty,
+        };
+        heater.set_duty(fill);
         let gpu_duty = if boost { duty } else { 0.0 };
         if let Some(g) = &gpu {
             g.set_duty(gpu_duty);
@@ -255,6 +296,12 @@ fn engine(
                 on_battery: r.on_battery,
                 watts: r.watts,
                 gpu: gpu.as_ref().map(|_| gpu_duty),
+                work: match (&work, &ended) {
+                    (Some(w), _) => w.label.clone(),
+                    (None, Some(e)) => format!("built-in heat ({e})"),
+                    (None, None) => "built-in heat".into(),
+                },
+                work_pct: work.as_ref().map(|_| project * 100.0),
                 history: history.iter().copied().collect(),
             };
             shared.lock().unwrap().status = status;
@@ -262,6 +309,9 @@ fn engine(
         thread::sleep(tick);
     }
     heater.stop();
+    if let Some(w) = work {
+        w.release();
+    }
 }
 
 /// Share of the heater allowed given sustained busy-program demand (in

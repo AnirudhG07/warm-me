@@ -23,6 +23,7 @@ mod gpu {
 mod heater;
 mod sensors;
 mod ui;
+mod work;
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
@@ -113,6 +114,18 @@ pub struct Opts {
     /// Don't use the GPU as a second heater while warming up
     #[arg(long)]
     no_gpu: bool,
+
+    /// Make the heat with real science instead of wasted math
+    #[arg(short, long, value_enum, conflicts_with_all = ["pid", "run"])]
+    work: Option<work::Project>,
+
+    /// Make the heat with a program that's already running (by process id)
+    #[arg(long, conflicts_with = "run")]
+    pid: Option<u32>,
+
+    /// Start a program and make the heat with it, e.g. --run "mprime -d"
+    #[arg(long, value_name = "COMMAND")]
+    run: Option<String>,
 }
 
 impl Opts {
@@ -143,7 +156,31 @@ impl Opts {
         if self.no_gpu {
             a.push("--no-gpu".into());
         }
+        if let Some(w) = self.work {
+            let v = w.to_possible_value().expect("no skipped variants");
+            a.extend(["--work".into(), v.get_name().into()]);
+        }
+        if let Some(p) = self.pid {
+            a.extend(["--pid".into(), p.to_string()]);
+        }
+        if let Some(r) = &self.run {
+            a.extend(["--run".into(), r.clone()]);
+        }
         a
+    }
+
+    /// What should make the heat.
+    pub fn work_spec(&self) -> work::Spec {
+        match (self.work, self.pid, &self.run) {
+            (Some(p), _, _) => work::Spec::Project(p),
+            (_, Some(pid), _) => work::Spec::Pid(pid),
+            (_, _, Some(cmd)) => work::Spec::Run(cmd.clone()),
+            _ => work::Spec::Builtin,
+        }
+    }
+
+    fn picks_work(&self) -> bool {
+        !matches!(self.work_spec(), work::Spec::Builtin)
     }
 }
 
@@ -186,7 +223,7 @@ fn open(opts: &Opts, plain: bool) {
 
 /// `warm on`: make sure the heater is running, then return.
 fn on(opts: &Opts) {
-    if let Some(info) = client::find() {
+    if let Some(info) = client::find().filter(|_| !opts.picks_work()) {
         client::apply(&info, opts);
         println!("warm is already on");
         return;
@@ -212,8 +249,14 @@ fn off() {
 
 fn connect_or_start(opts: &Opts) -> Info {
     if let Some(info) = client::find() {
-        client::apply(&info, opts);
-        return info;
+        if !opts.picks_work() {
+            client::apply(&info, opts);
+            return info;
+        }
+        // switching what makes the heat: start over with the new source
+        if !client::stop(&info) {
+            fail("couldn't stop the running heater to switch work");
+        }
     }
     // check here too, so a missing sensor is reported in this terminal
     let first = Sensors::new().read();
@@ -272,7 +315,10 @@ fn status_line(s: &Status) -> String {
     if let (true, Some(w)) = (s.on_battery, s.watts) {
         line += &format!(" {w:.1}W");
     }
-    line + &format!("  [{}]", s.state)
+    if let Some(p) = s.work_pct {
+        line += &format!("  project {p:.0}%");
+    }
+    line + &format!("  [{}]  {}", s.state, s.work)
 }
 
 pub fn resolve_source(wanted: Source, r: &Reading) -> Option<Source> {

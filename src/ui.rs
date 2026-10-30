@@ -154,7 +154,7 @@ fn draw_header(f: &mut Frame, area: Rect, s: &Status) {
         area,
     );
     f.render_widget(
-        Paragraph::new(format!("{} sensor · {m}m {sec:02}s ", s.sensor))
+        Paragraph::new(format!("{} · {} sensor · {m}m {sec:02}s ", s.work, s.sensor))
             .dim()
             .right_aligned(),
         area,
@@ -215,14 +215,23 @@ fn bar_scale(s: &Status) -> (f32, f32) {
 fn draw_stats(f: &mut Frame, area: Rect, s: &Status) {
     let sep = || Span::raw(" · ").dim();
     let mut spans = vec![
-        Span::raw(" heater ").dim(),
+        Span::raw(" heat ").dim(),
         Span::raw(format!("{:.0}%", s.duty * 100.0)).fg(ORANGE),
         Span::raw(format!(" (max {:.0}%)", s.max_duty * 100.0)).dim(),
+    ];
+    if let Some(p) = s.work_pct {
+        spans.extend([
+            sep(),
+            Span::raw("project ").dim(),
+            Span::raw(format!("{p:.0}%")).fg(Color::Green),
+        ]);
+    }
+    spans.extend([
         sep(),
         Span::raw("cpu ").dim(),
         Span::raw(format!("{:.0}%", s.cpu_pct)),
         Span::raw(format!(" (warm {:.0}%)", s.ours_pct)).dim(),
-    ];
+    ]);
     if let Some(g) = s.gpu.filter(|g| *g > 0.0) {
         spans.extend([
             sep(),
