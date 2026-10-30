@@ -93,7 +93,9 @@ impl Sensors {
 ///
 /// Counts only processes using a real share of a core. Background chatter
 /// (browser tabs, window server) is spread thin across many processes and is
-/// ignored; kernel time is skipped because OSes throttle a hot chip by
+/// ignored; so is housekeeping the OS itself runs at background priority
+/// (photo analysis, contact sync, indexing), which can keep a core busy for
+/// minutes. Kernel time is skipped because OSes throttle a hot chip by
 /// injecting it, which would make the heater switch itself off.
 pub struct Load {
     sys: System,
@@ -101,7 +103,18 @@ pub struct Load {
 }
 
 /// A process at or above this share of one core counts as "you working".
-const BUSY_PROCESS: f32 = 0.3;
+const BUSY_PROCESS: f32 = 0.5;
+
+/// One sample of CPU activity since the previous call.
+#[derive(Clone, Copy, Default)]
+pub struct Usage {
+    /// Demand from busy programs other than us, in cores.
+    pub busy: f32,
+    /// Whole-machine CPU use, percent of all cores.
+    pub total_pct: f32,
+    /// Our own share, percent of all cores.
+    pub ours_pct: f32,
+}
 
 impl Load {
     /// None if this platform can't report CPU usage; we then never yield.
@@ -109,24 +122,31 @@ impl Load {
         let sys = System::new().ok()?;
         let pid = sysinfo::get_current_pid().ok()?;
         let mut load = Load { sys, pid };
-        load.busy();
+        load.sample();
         Some(load)
     }
 
-    /// Usage since the previous call.
-    pub fn busy(&mut self) -> f32 {
+    pub fn sample(&mut self) -> Usage {
+        self.sys.refresh_cpu_usage();
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_cpu(),
         );
-        self.sys
+        let ncpu = self.sys.cpus().len().max(1) as f32;
+        let busy = self
+            .sys
             .processes()
             .values()
-            .filter(|p| p.pid() != self.pid && !is_kernel(p))
-            .map(|p| p.cpu_usage() / 100.0)
-            .filter(|&c| c >= BUSY_PROCESS)
-            .fold(0.0, |a, c| a + c)
+            .filter(|p| p.pid() != self.pid && p.cpu_usage() >= BUSY_PROCESS * 100.0)
+            .filter(|p| !is_kernel(p) && !is_background(p.pid().as_u32()))
+            .fold(0.0, |a, p| a + p.cpu_usage() / 100.0);
+        let ours = self.sys.process(self.pid).map_or(0.0, |p| p.cpu_usage());
+        Usage {
+            busy,
+            total_pct: self.sys.global_cpu_usage(),
+            ours_pct: (ours / ncpu).min(100.0),
+        }
     }
 }
 
@@ -139,6 +159,36 @@ fn is_kernel(p: &Process) -> bool {
         || (cfg!(target_os = "linux")
             && p.exe().is_none()
             && p.parent().is_some_and(|pp| pp.as_u32() == 2))
+}
+
+/// Running at background priority: work the OS or the program itself has
+/// marked as not urgent, so heating alongside it costs nobody anything.
+fn is_background(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // Darwin priority bands: 4 background, 20 utility, 31 default,
+        // 37+ user-initiated / interactive.
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let got = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        );
+        got == size && info.pti_priority < 20
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    unsafe {
+        // niced daemons (indexers, updaters); errors return -1, so not these
+        libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) > 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 fn is_cpu(label: &str) -> bool {

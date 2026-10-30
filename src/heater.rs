@@ -1,6 +1,10 @@
-//! Heat source: one low-priority worker per core running a duty-cycled
-//! FP + memory workload. Duty 0.0..=1.0 maps to the share of each 10 ms
-//! slice spent busy, so heat output is roughly proportional to duty.
+//! Heat source: one worker per core running a duty-cycled FP + memory
+//! workload. Duty 0.0..=1.0 maps to the share of each 10 ms slice spent
+//! busy, so heat output is roughly proportional to duty.
+//!
+//! Workers normally run at the lowest priority the OS offers. While warming
+//! up from cold they can be boosted to normal priority, so the laptop warms
+//! noticeably sooner; they drop back once the target is near.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -13,6 +17,7 @@ const DUTY_SCALE: f32 = 10_000.0;
 
 pub struct Heater {
     duty: Arc<AtomicU32>,
+    boost: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
 }
@@ -20,20 +25,22 @@ pub struct Heater {
 impl Heater {
     pub fn start(threads: usize) -> Self {
         let duty = Arc::new(AtomicU32::new(0));
+        let boost = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let workers = (0..threads)
             .map(|id| {
-                let (duty, stop) = (duty.clone(), stop.clone());
+                let (duty, boost, stop) = (duty.clone(), boost.clone(), stop.clone());
                 // stagger phases so workers don't all spike at once
                 let phase = PERIOD.mul_f32(id as f32 / threads as f32);
                 thread::Builder::new()
                     .name(format!("warm-me-{id}"))
-                    .spawn(move || worker(phase, &duty, &stop))
+                    .spawn(move || worker(phase, &duty, &boost, &stop))
                     .expect("spawn worker")
             })
             .collect();
         Heater {
             duty,
+            boost,
             stop,
             workers,
         }
@@ -44,6 +51,11 @@ impl Heater {
         self.duty.store(d, Ordering::Relaxed);
     }
 
+    /// Normal priority (warming up) or lowest priority (holding).
+    pub fn set_boost(&self, on: bool) {
+        self.boost.store(on, Ordering::Relaxed);
+    }
+
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         for w in self.workers {
@@ -52,11 +64,18 @@ impl Heater {
     }
 }
 
-fn worker(phase: Duration, duty: &AtomicU32, stop: &AtomicBool) {
-    lower_thread_priority();
+fn worker(phase: Duration, duty: &AtomicU32, boost: &AtomicBool, stop: &AtomicBool) {
+    let mut boosted = false;
+    set_thread_priority(false);
     let mut work = Work::new();
     thread::sleep(phase);
     while !stop.load(Ordering::Relaxed) {
+        // each thread sets its own priority (macOS only allows that)
+        let want = boost.load(Ordering::Relaxed);
+        if want != boosted {
+            set_thread_priority(want);
+            boosted = want;
+        }
         let d = duty.load(Ordering::Relaxed) as f32 / DUTY_SCALE;
         if d <= 0.0 {
             thread::sleep(Duration::from_millis(100));
@@ -122,34 +141,54 @@ impl Work {
     }
 }
 
-/// Lowest priority the OS offers that still lets us heat:
-/// the scheduler hands the CPU to anything else that wants it.
-fn lower_thread_priority() {
+/// Lowest priority the OS offers that still lets us heat, so the scheduler
+/// hands the CPU to anything else that wants it; or, boosted, the same
+/// priority as ordinary programs. Best effort: if the OS refuses a change,
+/// the thread keeps its current priority.
+fn set_thread_priority(boost: bool) {
     #[cfg(target_os = "linux")]
     unsafe {
         // SCHED_IDLE: below nice 19, runs only on otherwise-idle CPU time.
-        // pid 0 = the calling thread on Linux.
+        // Unprivileged threads may move back to SCHED_OTHER at their current
+        // nice, so we leave nice alone. pid 0 = the calling thread on Linux.
         let param = libc::sched_param { sched_priority: 0 };
-        if libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) != 0 {
-            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
-        }
+        let policy = if boost {
+            libc::SCHED_OTHER
+        } else {
+            libc::SCHED_IDLE
+        };
+        libc::sched_setscheduler(0, policy, &param);
     }
 
     #[cfg(target_os = "macos")]
     unsafe {
         // Utility QoS yields to interactive work but may still use P-cores.
         // (Background QoS would pin us to E-cores, which make little heat.)
-        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        // Boosted: default QoS, like any program you start yourself.
+        let qos = if boost {
+            libc::qos_class_t::QOS_CLASS_DEFAULT
+        } else {
+            libc::qos_class_t::QOS_CLASS_UTILITY
+        };
+        libc::pthread_set_qos_class_self_np(qos, 0);
     }
 
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Threading::*;
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        let priority = if boost {
+            THREAD_PRIORITY_NORMAL
+        } else {
+            THREAD_PRIORITY_IDLE
+        };
+        SetThreadPriority(GetCurrentThread(), priority);
     }
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        // nice can't be lowered again without privileges, so no boost here
+        if !boost {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        }
     }
 }

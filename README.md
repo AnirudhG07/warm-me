@@ -1,58 +1,34 @@
 # warm-me
 
-Keep your laptop warm in the cold by turning spare CPU into heat — without
-getting in the way of what you're actually doing.
+> Warning! Stupid but a very "guy nerd" idea ahead. Use at your own risk.
 
-```
-warm-me              # hold the battery at 35°C
-warm-me 38           # different target (battery targets cap at 40°C)
-warm-me -m 50        # gentler: never more than 50% heater duty
-warm-me -p           # only heat while plugged in
-warm-me --list       # show every temperature sensor it can see
-```
+Get this... You are coding(or these days, vibe coding) using your laptop keyboard, but it is soo cold around you that you wish you could just touch something warm. What do you do???
 
-Runs on macOS, Linux and Windows (Intel, AMD and Apple Silicon).
+**Options**:
 
-## How it works
+1. Be in a better and warmer workplace(could be a buying a heater or better air conditioning)... NAH!
+2. Wear gloves while coding... makes it hard and you look ridiculous while working.
+3. Warm your laptop! and feel the warmth from your laptop on yourself. THAT's IT!
 
-**Sensor.** Regulates on battery temperature by default: the pack sits under
-most of the chassis, so it tracks how warm the laptop feels, and it's the part
-that suffers most in the cold. Machines without a battery sensor fall back to
-the hottest CPU die sensor (`--sensor cpu`, default target 55°C).
-
-**Heater.** One worker per core runs wide floating-point math plus streaming
-memory copies, which draws more power than an idle spin. Each worker is
-duty-cycled in 10 ms slices, so heat output is continuous from 0 to 100%
-rather than on/off.
-
-**Controller.** A PI loop sets the duty from the temperature gap. Battery
-temperature lags the heater by minutes, so the loop acts on where the
-temperature is *heading* (10 minutes out at the current rate) and only learns
-extra steady-state power when progress stalls. That's what lets it find the
-right output for any machine in any room without overshooting: in simulation
-it settles on target with 0.2–0.4°C overshoot (`cargo test`).
-
-**Staying out of your way.**
-- Workers run at the lowest priority the OS offers: `SCHED_IDLE` on Linux,
-  utility QoS on macOS, idle priority on Windows.
-- Priority alone isn't enough: on modern chips, busy cores pull down shared
-  clocks and power budget for everyone. So four times a second warm-me checks
-  for programs using a real share of a core, and steps aside while they run —
-  their work is making heat anyway. It returns gradually once they finish.
-  In testing, a CPU-bound job ran 3% slower alongside warm-me, versus 2–3×
-  slower next to a naive busy loop. Use `--no-yield` to heat regardless.
-- Backs off if the CPU passes 95°C (`--cpu-limit`).
-
-**Battery.** Every watt of heat comes out of the battery or the charger;
-software can't change that. warm-me only makes the heat needed to hold the
-target, pauses on battery below 20% (`--min-battery`), and `-p` restricts it to
-wall power. It warns if the battery is charging below 0°C, which damages
-lithium cells: warm up first, then plug in.
+Have you never thought about it? When your laptop is running heavy stuff, it gets warm. You worry about your laptop getting hot instead of taking the warmth from it. Even your partner doesn't give you this much instant warmth.
 
 ## Install
 
-```
+```bash
 cargo install --git https://github.com/AnirudhG07/warm-me
 ```
 
-or from a clone: `cargo install --path .`
+## How to use
+
+```bash
+warm        # start heating and watch it live (↑↓ change temp, q to leave)
+warm on     # start heating in the background
+warm off    # stop it
+warm help   # all the other options
+```
+
+## How it works
+
+We tap into your laptop's temperature sensors (battery one mostly, it sits under your palms so it's closest to what you feel) and read them every second. Too cold? we burn more CPU and GPU. Warm enough? we chill and just keep it there.
+
+We try not to mess with your work much by running at the lowest priority, and backing off whenever you're doing something heavy yourself. Your stuff makes heat anyway lol.
